@@ -35,6 +35,13 @@ const STABILITY_HZ = 160; // max drift from rolling mean peak freq
 const SUSTAIN_MS = 450; // tone must hold this long before it counts
 const RELEASE_MS = 350; // tone must vanish this long before whistle ends
 const REFRACTORY_MS = 3000; // min gap between two counted whistles
+// Before a whistle latches, a candidate tone may only drop out this long;
+// otherwise sparse tonal frames in chatter/clangs bridge into a false count
+// (found by scripts/harness.ts at high sensitivity).
+const CANDIDATE_GAP_MS = 120;
+
+/** dBFS loudness floor for a 0..1 sensitivity: 0 → -28 dB, 1 → -58 dB */
+export const thresholdDbFor = (sensitivity: number) => -28 - 30 * sensitivity;
 
 export class WhistleDetector {
   private opts: DetectorOptions;
@@ -44,12 +51,7 @@ export class WhistleDetector {
   private freqData: Float32Array<ArrayBuffer> = new Float32Array(0);
   private raf = 0;
 
-  private whistling = false;
-  private count = 0;
-  private holdStart = 0; // ts when candidate tone first appeared
-  private lastGoodFrame = 0; // ts of last whistle-like frame
-  private lastCountAt = -Infinity;
-  private recentFreqs: number[] = [];
+  private core = new WhistleCore();
 
   constructor(opts: DetectorOptions) {
     this.opts = opts;
@@ -57,11 +59,6 @@ export class WhistleDetector {
 
   setSensitivity(s: number) {
     this.opts.sensitivity = s;
-  }
-
-  /** dBFS loudness floor: sensitivity 0 → -28 dB (needs to be very loud), 1 → -58 dB */
-  private get thresholdDb() {
-    return -28 - 30 * this.opts.sensitivity;
   }
 
   async start() {
@@ -92,13 +89,12 @@ export class WhistleDetector {
     this.ctx = null;
     this.stream = null;
     this.analyser = null;
-    this.whistling = false;
-    this.recentFreqs = [];
+    this.core.reset();
     this.emit(false, 0, -120, 0, 0);
   }
 
   resetCount() {
-    this.count = 0;
+    this.core.count = 0;
   }
 
   private emit(
@@ -111,7 +107,7 @@ export class WhistleDetector {
     this.opts.onFrame({
       running: !!this.ctx,
       whistling,
-      count: this.count,
+      count: this.core.count,
       peakFreq,
       peakDb,
       prominenceDb,
@@ -126,25 +122,64 @@ export class WhistleDetector {
     this.raf = requestAnimationFrame(this.loop);
 
     analyser.getFloatFrequencyData(this.freqData);
-    const binHz = ctx.sampleRate / analyser.fftSize;
+    const f = this.core.process(
+      this.freqData,
+      ctx.sampleRate / analyser.fftSize,
+      performance.now(),
+      thresholdDbFor(this.opts.sensitivity),
+    );
+    if (f.ended) this.opts.onWhistleEnd(this.core.count);
+    if (f.started) this.opts.onWhistleStart();
+    this.emit(this.core.whistling, f.whistleFrame ? f.peakFreq : 0, f.peakDb, f.prominence, f.holdMs);
+  };
+}
+
+export interface FrameResult {
+  whistleFrame: boolean;
+  peakFreq: number;
+  peakDb: number;
+  prominence: number;
+  holdMs: number;
+  started: boolean; // a whistle was counted on this frame
+  ended: boolean; // the current whistle ended on this frame
+}
+
+/**
+ * Pure per-frame decision logic, independent of Web Audio so it can be driven
+ * offline (see scripts/harness.ts) with synthesized spectra.
+ */
+export class WhistleCore {
+  whistling = false;
+  count = 0;
+  private holdStart = 0; // ts when candidate tone first appeared
+  private lastGoodFrame = 0; // ts of last whistle-like frame
+  private lastCountAt = -Infinity;
+  private recentFreqs: number[] = [];
+
+  reset() {
+    this.whistling = false;
+    this.holdStart = 0;
+    this.recentFreqs = [];
+  }
+
+  process(freqData: Float32Array, binHz: number, now: number, thresholdDb: number): FrameResult {
     const lo = Math.floor(BAND_LOW_HZ / binHz);
-    const hi = Math.min(Math.ceil(BAND_HIGH_HZ / binHz), this.freqData.length - 1);
+    const hi = Math.min(Math.ceil(BAND_HIGH_HZ / binHz), freqData.length - 1);
 
     let peakBin = lo;
     let peakDb = -Infinity;
     for (let i = lo; i <= hi; i++) {
-      if (this.freqData[i] > peakDb) {
-        peakDb = this.freqData[i];
+      if (freqData[i] > peakDb) {
+        peakDb = freqData[i];
         peakBin = i;
       }
     }
-    const band = Array.from(this.freqData.subarray(lo, hi + 1)).sort((a, b) => a - b);
+    const band = Array.from(freqData.subarray(lo, hi + 1)).sort((a, b) => a - b);
     const medianDb = band[band.length >> 1];
     const prominence = peakDb - medianDb;
     const peakFreq = peakBin * binHz;
 
-    const now = performance.now();
-    const loudEnough = peakDb > this.thresholdDb;
+    const loudEnough = peakDb > thresholdDb;
     const narrowband = prominence > PROMINENCE_DB;
 
     // Frequency stability vs the rolling mean of recent peaks
@@ -154,15 +189,17 @@ export class WhistleDetector {
     const stable = this.recentFreqs.length >= 6 && Math.abs(peakFreq - mean) < STABILITY_HZ;
 
     const whistleFrame = loudEnough && narrowband && stable;
+    let started = false;
+    let ended = false;
 
     if (whistleFrame) {
       if (this.holdStart === 0) this.holdStart = now;
       this.lastGoodFrame = now;
-    } else if (now - this.lastGoodFrame > RELEASE_MS) {
+    } else if (now - this.lastGoodFrame > (this.whistling ? RELEASE_MS : CANDIDATE_GAP_MS)) {
       this.holdStart = 0;
       if (this.whistling) {
         this.whistling = false;
-        this.opts.onWhistleEnd(this.count);
+        ended = true;
       }
     }
 
@@ -177,9 +214,9 @@ export class WhistleDetector {
       this.whistling = true;
       this.count += 1;
       this.lastCountAt = now;
-      this.opts.onWhistleStart();
+      started = true;
     }
 
-    this.emit(this.whistling, whistleFrame ? peakFreq : 0, peakDb, prominence, holdMs);
-  };
+    return { whistleFrame, peakFreq, peakDb, prominence, holdMs, started, ended };
+  }
 }
